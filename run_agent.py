@@ -133,7 +133,7 @@ from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
-    MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
+    MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE, ZEP_MEMORY_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
     build_nous_subscription_prompt,
@@ -4939,6 +4939,8 @@ class AIAgent:
             tool_guidance.append(MEMORY_GUIDANCE)
         if "session_search" in self.valid_tool_names:
             tool_guidance.append(SESSION_SEARCH_GUIDANCE)
+        # Zep memory guidance — always injected when agent has tools
+        tool_guidance.append(ZEP_MEMORY_GUIDANCE)
         if "skill_manage" in self.valid_tool_names:
             tool_guidance.append(SKILLS_GUIDANCE)
         # Kanban worker/orchestrator lifecycle — only present when the

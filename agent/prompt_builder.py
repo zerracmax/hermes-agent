@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -171,6 +172,18 @@ SESSION_SEARCH_GUIDANCE = (
     "When the user references something from a past conversation or you suspect "
     "relevant cross-session context exists, use session_search to recall it before "
     "asking them to repeat themselves."
+)
+
+ZEP_MEMORY_GUIDANCE = (
+    "## Zep Cloud — Persistent Memory\n"
+    "Your long-term memory is Zep Cloud. At the START of every session, you MUST:\n"
+    "1. Run `python3 ~/.hermes/scripts/zep_loader.py hermes` to load context\n"
+    "2. Check BOTH `~/.hermes/.env` AND `~/.hermes/config.yaml` for API keys\n"
+    "3. When unsure about past conversations, use session_search before guessing\n"
+    "4. Save important facts to Zep (not just the memory tool which is limited)\n"
+    "The `load_zep_context()` function runs automatically each session — "
+    "but you still must respect its output as ground truth.\n"
+    "Never say 'not found' or 'I don't know' without checking ALL sources."
 )
 
 SKILLS_GUIDANCE = (
@@ -1031,12 +1044,48 @@ def _truncate_content(content: str, filename: str, max_chars: int = CONTEXT_FILE
     return head + marker + tail
 
 
+def load_zep_context() -> Optional[str]:
+    """Run the Zep Cloud context loader and return its output.
+
+    Called automatically at session start from load_soul_md().
+    Injects Zep's persistent facts into the system prompt so the
+    agent doesn't forget past conversations or configurations.
+    Returns None if Zep is unavailable or fails silently.
+    """
+    try:
+        hermes_home = get_hermes_home()
+        loader = hermes_home / "scripts" / "zep_loader.py"
+        if not loader.exists():
+            return None
+        result = subprocess.run(
+            ["python3", str(loader), "hermes"],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            logger.debug("Zep loader exited with code %d: %s",
+                         result.returncode, result.stderr.strip() or result.stdout.strip())
+            return None
+        zep_output = result.stdout.strip()
+        if not zep_output:
+            return None
+        # Wrap in a labelled section for the system prompt
+        return "=== ZEP CONTEXT ===\n" + zep_output.split("=== ZEP CONTEXT ===")[-1].strip() + "\n=== END ZEP CONTEXT ==="
+    except subprocess.TimeoutExpired:
+        logger.debug("Zep loader timed out after 30s")
+        return None
+    except Exception as e:
+        logger.debug("Zep loader error: %s", e)
+        return None
+
+
 def load_soul_md() -> Optional[str]:
     """Load SOUL.md from HERMES_HOME and return its content, or None.
 
     Used as the agent identity (slot #1 in the system prompt).  When this
     returns content, ``build_context_files_prompt`` should be called with
     ``skip_soul=True`` so SOUL.md isn't injected twice.
+
+    Also loads Zep Cloud context automatically on every session start.
     """
     try:
         from hermes_cli.config import ensure_hermes_home
@@ -1053,6 +1102,12 @@ def load_soul_md() -> Optional[str]:
             return None
         content = _scan_context_content(content, "SOUL.md")
         content = _truncate_content(content, "SOUL.md")
+
+        # Auto-load Zep Cloud context on every session start
+        zep_context = load_zep_context()
+        if zep_context:
+            content += "\n\n" + zep_context
+
         return content
     except Exception as e:
         logger.debug("Could not read SOUL.md from %s: %s", soul_path, e)
