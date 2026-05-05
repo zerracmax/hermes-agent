@@ -344,7 +344,28 @@ class ContextCompressor(ContextEngine):
         self._last_aux_model_failure_model = None
         self._last_compression_savings_pct = 100.0
         self._ineffective_compression_count = 0
-        self._summary_failure_cooldown_until = 0.0  # transient errors must not block a fresh session
+        self._summary_failure_cooldown_until = 0.0
+
+    def on_session_end(self, session_id: str, messages: list) -> None:
+        """Archive session summary to daily memory when session ends."""
+        if not messages:
+            return
+        try:
+            from tools.memory_tool import MemoryStore
+            store = MemoryStore()
+            store.load_from_disk()
+            # Build a brief summary from last user/assistant exchange
+            last_turns = []
+            for msg in reversed(messages[-10:]):
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                if role in ("user", "assistant") and content:
+                    text = content[:200] if len(content) > 200 else content
+                    last_turns.insert(0, f"[{role}] {text}")
+            summary = "\n".join(last_turns) if last_turns else "Session ended."
+            store.archive_daily(summary)
+        except Exception as e:
+            logger.warning("on_session_end archive failed: %s", e)
 
     def update_model(
         self,

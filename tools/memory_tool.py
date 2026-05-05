@@ -29,6 +29,7 @@ import os
 import re
 import tempfile
 from contextlib import contextmanager
+from datetime import date, datetime
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional
@@ -106,25 +107,36 @@ def _scan_memory_content(content: str) -> Optional[str]:
 
 class MemoryStore:
     """
-    Bounded curated memory with file persistence. One instance per AIAgent.
+    Memory with 3-layer persistence — inspired by CowAgent.
 
-    Maintains two parallel states:
-      - _system_prompt_snapshot: frozen at load time, used for system prompt injection.
-        Never mutated mid-session. Keeps prefix cache stable.
-      - memory_entries / user_entries: live state, mutated by tool calls, persisted to disk.
-        Tool responses always reflect this live state.
+    Layers:
+      Layer 1 — MEMORY.md / USER.md: loaded at session start (system prompt).
+               Entries are persisted here for long-term facts.
+               NO character limit — grows with you.
+
+      Layer 2 — Daily memory /memories/daily/YYYY-MM-DD.md: written
+               automatically when context is trimmed or session ends.
+               Stores conversation summaries per day.
+
+      Layer 3 — Dreams (distillation): /memories/dreams/YYYY-MM-DD.md
+               written by the daily summary cron, consolidates daily
+               entries into refined long-term facts.
     """
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(self, memory_char_limit: int = 999999, user_char_limit: int = 999999):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
+        # Track daily archive for today
+        self._today = date.today()
+        self._daily_archive_written = False
 
     def load_from_disk(self):
-        """Load entries from MEMORY.md and USER.md, capture system prompt snapshot."""
+        """Load entries from MEMORY.md and USER.md, capture system prompt snapshot.
+        Also loads recent daily memories (last 7 days) as context entries."""
         mem_dir = get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
 
@@ -134,6 +146,41 @@ class MemoryStore:
         # Deduplicate entries (preserves order, keeps first occurrence)
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
         self.user_entries = list(dict.fromkeys(self.user_entries))
+
+        # Load recent daily memories (last 7 days) as context
+        daily_dir = mem_dir / "daily"
+        if daily_dir.exists():
+            from datetime import timedelta
+            for i in range(1, 8):
+                d = date.today() - timedelta(days=i)
+                daily_file = daily_dir / f"{d.isoformat()}.md"
+                if daily_file.exists():
+                    try:
+                        content = daily_file.read_text(encoding="utf-8").strip()
+                        if content:
+                            # Add as memory entry with date prefix, avoid duplication
+                            entry = f"[Daily {d.isoformat()}] {content}"
+                            if entry not in self.memory_entries:
+                                self.memory_entries.append(entry)
+                    except (OSError, IOError):
+                        pass
+
+        # Load dream summaries (last 7 days)
+        dream_dir = mem_dir / "dreams"
+        if dream_dir.exists():
+            from datetime import timedelta
+            for i in range(1, 15, 2):  # every 2 days back, up to 15
+                d = date.today() - timedelta(days=i)
+                dream_file = dream_dir / f"{d.isoformat()}.md"
+                if dream_file.exists():
+                    try:
+                        content = dream_file.read_text(encoding="utf-8").strip()
+                        if content:
+                            entry = f"[Dream {d.isoformat()}] {content}"
+                            if entry not in self.memory_entries:
+                                self.memory_entries.append(entry)
+                    except (OSError, IOError):
+                        pass
 
         # Capture frozen snapshot for system prompt injection
         self._system_prompt_snapshot = {
@@ -222,7 +269,7 @@ class MemoryStore:
         return self.memory_char_limit
 
     def add(self, target: str, content: str) -> Dict[str, Any]:
-        """Append a new entry. Returns error if it would exceed the char limit."""
+        """Append a new entry. No character limit."""
         content = content.strip()
         if not content:
             return {"success": False, "error": "Content cannot be empty."}
@@ -237,28 +284,10 @@ class MemoryStore:
             self._reload_target(target)
 
             entries = self._entries_for(target)
-            limit = self._char_limit(target)
 
             # Reject exact duplicates
             if content in entries:
                 return self._success_response(target, "Entry already exists (no duplicate added).")
-
-            # Calculate what the new total would be
-            new_entries = entries + [content]
-            new_total = len(ENTRY_DELIMITER.join(new_entries))
-
-            if new_total > limit:
-                current = self._char_count(target)
-                return {
-                    "success": False,
-                    "error": (
-                        f"Memory at {current:,}/{limit:,} chars. "
-                        f"Adding this entry ({len(content)} chars) would exceed the limit. "
-                        f"Replace or remove existing entries first."
-                    ),
-                    "current_entries": entries,
-                    "usage": f"{current:,}/{limit:,}",
-                }
 
             entries.append(content)
             self._set_entries(target, entries)
@@ -302,21 +331,9 @@ class MemoryStore:
                 # All identical -- safe to replace just the first
 
             idx = matches[0][0]
-            limit = self._char_limit(target)
 
-            # Check that replacement doesn't blow the budget
             test_entries = entries.copy()
             test_entries[idx] = new_content
-            new_total = len(ENTRY_DELIMITER.join(test_entries))
-
-            if new_total > limit:
-                return {
-                    "success": False,
-                    "error": (
-                        f"Replacement would put memory at {new_total:,}/{limit:,} chars. "
-                        f"Shorten the new content or remove other entries first."
-                    ),
-                }
 
             entries[idx] = new_content
             self._set_entries(target, entries)
@@ -358,6 +375,41 @@ class MemoryStore:
 
         return self._success_response(target, "Entry removed.")
 
+    def archive_daily(self, summary: str) -> Dict[str, Any]:
+        """Write a daily summary to /memories/daily/YYYY-MM-DD.md (Layer 2)."""
+        mem_dir = get_memory_dir()
+        daily_dir = mem_dir / "daily"
+        daily_dir.mkdir(parents=True, exist_ok=True)
+
+        today_str = date.today().isoformat()
+        daily_file = daily_dir / f"{today_str}.md"
+
+        try:
+            daily_file.write_text(summary.strip(), encoding="utf-8")
+            self._daily_archive_written = True
+            logger.info("Daily memory archived to %s", daily_file)
+            return {"success": True, "path": str(daily_file)}
+        except (OSError, IOError) as e:
+            logger.error("Failed to write daily memory: %s", e)
+            return {"success": False, "error": str(e)}
+
+    def archive_dream(self, dream_summary: str) -> Dict[str, Any]:
+        """Write a dream distillation to /memories/dreams/YYYY-MM-DD.md (Layer 3)."""
+        mem_dir = get_memory_dir()
+        dream_dir = mem_dir / "dreams"
+        dream_dir.mkdir(parents=True, exist_ok=True)
+
+        today_str = date.today().isoformat()
+        dream_file = dream_dir / f"{today_str}.md"
+
+        try:
+            dream_file.write_text(dream_summary.strip(), encoding="utf-8")
+            logger.info("Dream archived to %s", dream_file)
+            return {"success": True, "path": str(dream_file)}
+        except (OSError, IOError) as e:
+            logger.error("Failed to write dream: %s", e)
+            return {"success": False, "error": str(e)}
+
     def format_for_system_prompt(self, target: str) -> Optional[str]:
         """
         Return the frozen snapshot for system prompt injection.
@@ -376,14 +428,12 @@ class MemoryStore:
     def _success_response(self, target: str, message: str = None) -> Dict[str, Any]:
         entries = self._entries_for(target)
         current = self._char_count(target)
-        limit = self._char_limit(target)
-        pct = min(100, int((current / limit) * 100)) if limit > 0 else 0
 
         resp = {
             "success": True,
             "target": target,
             "entries": entries,
-            "usage": f"{pct}% — {current:,}/{limit:,} chars",
+            "usage": f"{current:,} chars — unlimited",
             "entry_count": len(entries),
         }
         if message:
@@ -395,15 +445,13 @@ class MemoryStore:
         if not entries:
             return ""
 
-        limit = self._char_limit(target)
         content = ENTRY_DELIMITER.join(entries)
         current = len(content)
-        pct = min(100, int((current / limit) * 100)) if limit > 0 else 0
 
         if target == "user":
-            header = f"USER PROFILE (who the user is) [{pct}% — {current:,}/{limit:,} chars]"
+            header = f"USER PROFILE (who the user is) [{current:,} chars]"
         else:
-            header = f"MEMORY (your personal notes) [{pct}% — {current:,}/{limit:,} chars]"
+            header = f"MEMORY (your personal notes) [{current:,} chars]"
 
         separator = "═" * 46
         return f"{separator}\n{header}\n{separator}\n{content}"
@@ -497,8 +545,18 @@ def memory_tool(
             return tool_error("old_text is required for 'remove' action.", success=False)
         result = store.remove(target, old_text)
 
+    elif action == "archive_daily":
+        if not content:
+            return tool_error("content (summary) is required for 'archive_daily' action.", success=False)
+        result = store.archive_daily(content)
+
+    elif action == "archive_dream":
+        if not content:
+            return tool_error("content (dream summary) is required for 'archive_dream' action.", success=False)
+        result = store.archive_dream(content)
+
     else:
-        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
+        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove, archive_daily, archive_dream", success=False)
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -543,7 +601,7 @@ MEMORY_SCHEMA = {
             "action": {
                 "type": "string",
                 "enum": ["add", "replace", "remove"],
-                "description": "The action to perform."
+                "description": "The action to perform. 'add' appends a new entry, 'replace' updates an existing one by old_text, 'remove' deletes an entry. Also available (for system use): 'archive_daily' and 'archive_dream' to write daily/dream memory summaries."
             },
             "target": {
                 "type": "string",
