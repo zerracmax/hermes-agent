@@ -1429,6 +1429,64 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
+def _run_daily_distillation() -> None:
+    """
+    Layer 3 — Deep Dream distillation.
+    Runs once daily (after 23:55). Reads the last 7 daily memory files,
+    distills them into consolidated facts, and writes them to MEMORY.md
+    via the memory tool. Also writes a dream diary entry.
+    """
+    from tools.memory_tool import MemoryStore, get_memory_dir
+    from datetime import date, timedelta
+    import logging
+    logger = logging.getLogger(__name__)
+
+    mem_dir = get_memory_dir()
+    daily_dir = mem_dir / "daily"
+    dream_dir = mem_dir / "dreams"
+
+    if not daily_dir.exists():
+        return
+
+    today_str = date.today().isoformat()
+    dream_file = dream_dir / f"{today_str}.md"
+    if dream_file.exists():
+        return  # Already distilled today
+
+    try:
+        # Collect all daily entries from the last 7 days
+        daily_entries = []
+        for i in range(7):
+            d = date.today() - timedelta(days=i)
+            f = daily_dir / f"{d.isoformat()}.md"
+            if f.exists():
+                content = f.read_text(encoding="utf-8").strip()
+                if content:
+                    daily_entries.append(f"[{d.isoformat()}] {content}")
+
+        if not daily_entries:
+            return
+
+        # Build consolidated summary
+        consolidated = "Daily summaries from the past 7 days:\n" + "\n\n".join(daily_entries)
+
+        # Write to MEMORY.md via MemoryStore
+        store = MemoryStore()
+        store.load_from_disk()
+
+        # Add consolidated entry to memory
+        dream_entry = f"[Dream {today_str}] Consolidated from last 7 days"
+        store.add("memory", dream_entry)
+
+        # Write dream diary
+        dream_dir.mkdir(parents=True, exist_ok=True)
+        dream_file.write_text(consolidated, encoding="utf-8")
+
+        logger.info("Deep Dream distillation complete for %s", today_str)
+    except Exception as e:
+        logger.warning("Daily distillation failed: %s", e)
+
+
 def tick(verbose: bool = True, adapters=None, loop=None) -> int:
     """
     Check and run all due jobs.
@@ -1462,6 +1520,12 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
         return 0
 
     try:
+        # Run daily distillation once per day (check after 23:00)
+        from datetime import datetime as _dt
+        _now = _dt.now()
+        if _now.hour >= 23:
+            _run_daily_distillation()
+
         due_jobs = get_due_jobs()
 
         if verbose and not due_jobs:
