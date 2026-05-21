@@ -9882,7 +9882,7 @@ class GatewayRunner:
 
         # Read current model/provider from config
         current_model = ""
-        current_provider = "openrouter"
+        current_provider = "deepseek"
         current_base_url = ""
         current_api_key = ""
         user_provs = None
